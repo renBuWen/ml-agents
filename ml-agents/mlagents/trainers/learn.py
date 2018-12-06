@@ -5,10 +5,14 @@ import logging
 import os
 import multiprocessing
 import numpy as np
+import yaml
 from docopt import docopt
 
 from .trainer_controller import TrainerController
+from . import MetaCurriculumError, MetaCurriculum
 from .exception import TrainerError
+from mlagents.envs import UnityEnvironment
+from mlagents.envs.exception import UnityEnvironmentException
 
 
 def run_training(sub_id, run_seed, run_options):
@@ -31,20 +35,104 @@ def run_training(sub_id, run_seed, run_options):
     save_freq = int(run_options['--save-freq'])
     keep_checkpoints = int(run_options['--keep-checkpoints'])
     worker_id = int(run_options['--worker-id'])
-    curriculum_file = (run_options['--curriculum']
+    curriculum_folder = (run_options['--curriculum']
         if run_options['--curriculum'] != 'None' else None)
     lesson = int(run_options['--lesson'])
     fast_simulation = not bool(run_options['--slow'])
     no_graphics = run_options['--no-graphics']
     trainer_config_path = run_options['<trainer-config-path>']
 
+    # Recognize and use docker volume if one is passed as an argument
+    if not docker_target_name:
+        model_path = './models/{run_id}'.format(run_id=run_id)
+        summaries_dir = './summaries'
+    else:
+        trainer_config_path = \
+            '/{docker_target_name}/{trainer_config_path}'.format(
+                docker_target_name=docker_target_name,
+                trainer_config_path = trainer_config_path)
+        if curriculum_folder is not None:
+            curriculum_folder = \
+                '/{docker_target_name}/{curriculum_folder}'.format(
+                    docker_target_name=docker_target_name,
+                    curriculum_folder=curriculum_folder)
+        model_path = '/{docker_target_name}/models/{run_id}'.format(
+            docker_target_name=docker_target_name,
+            run_id=run_id)
+        summaries_dir = '/{docker_target_name}/summaries'.format(
+            docker_target_name=docker_target_name)
+
+    env = init_environment(env_path, docker_target_name, no_graphics, worker_id + sub_id, fast_simulation, run_seed)
+
+    if curriculum_folder is None:
+        meta_curriculum = None
+    else:
+        meta_curriculum = MetaCurriculum(curriculum_folder, env._resetParameters)
+
+    if meta_curriculum:
+        for brain_name in meta_curriculum.brains_to_curriculums.keys():
+            if brain_name not in env.external_brain_names:
+                raise MetaCurriculumError('One of the curriculums '
+                                          'defined in ' +
+                                          curriculum_folder + ' '
+                                                                   'does not have a corresponding '
+                                                                   'Brain. Check that the '
+                                                                   'curriculum file has the same '
+                                                                   'name as the Brain '
+                                                                   'whose curriculum it defines.')
+    if env_path is None:
+        env_name = 'editor_' + env.academy_name
+    else:
+        # Extract out name of environment
+        env_name = os.path.basename(os.path.normpath(env_path))
+
+    external_brains = {}
+    for brain_name in env.external_brain_names:
+        external_brains[brain_name] = env.brains[brain_name]
+    trainer_config = load_config(trainer_config_path)
+
     # Create controller and begin training.
-    tc = TrainerController(env_path, run_id + '-' + str(sub_id),
-                           save_freq, curriculum_file, fast_simulation,
-                           load_model, train_model, worker_id + sub_id,
-                           keep_checkpoints, lesson, run_seed,
-                           docker_target_name, trainer_config_path, no_graphics)
-    tc.start_learning()
+    tc = TrainerController(env_name, model_path, summaries_dir, run_id + '-' + str(sub_id),
+                           save_freq, meta_curriculum,
+                           load_model, train_model,
+                           keep_checkpoints, lesson, external_brains, run_seed)
+    tc.start_learning(env, trainer_config)
+
+
+def load_config(trainer_config_path):
+    try:
+        with open(trainer_config_path) as data_file:
+            trainer_config = yaml.load(data_file)
+            return trainer_config
+    except IOError:
+        raise UnityEnvironmentException('Parameter file could not be found '
+                                        'at {}.'
+                                        .format(trainer_config_path))
+    except UnicodeDecodeError:
+        raise UnityEnvironmentException('There was an error decoding '
+                                        'Trainer Config from this path : {}'
+                                        .format(trainer_config_path))
+
+
+def init_environment(env_path, docker_target_name, no_graphics, worker_id, fast_simulation, seed):
+    if env_path is not None:
+        # Strip out executable extensions if passed
+        env_path = (env_path.strip()
+                    .replace('.app', '')
+                    .replace('.exe', '')
+                    .replace('.x86_64', '')
+                    .replace('.x86', ''))
+    docker_training = docker_target_name is not None
+    if docker_training and env_path is not None:
+        env_path = '/{docker_target_name}/{env_name}'.format(
+            docker_target_name=docker_target_name, env_name=env_path)
+    return UnityEnvironment(file_name=env_path,
+                                worker_id=worker_id,
+                                seed=seed,
+                                docker_training=docker_training,
+                                no_graphics=no_graphics,
+                                train_mode=fast_simulation
+                            )
 
 
 def main():
